@@ -1,0 +1,15 @@
+cc_binary {
+    name: "pwn",
+    srcs: [
+        "pwn.cpp",
+    ],
+    shared_libs: [
+	"libutils",
+        "libbinder",
+	"libmedia",
+    ],
+	
+    cflags: [
+	"-O3",
+    ]
+}
